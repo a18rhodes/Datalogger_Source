@@ -126,14 +126,16 @@ void rtc_match_callback(void)
 	/* Errata 14539 fix */
 	GCLK->GENCTRL->bit.SRC = SYSTEM_CLOCK_SOURCE_OSC16M;
 	
+	ADT7420_read_temp();
+	
 	// Set a new alarm for the interval depending on what mode we are in
 	// This method is according to the Atmel App note AT03266
-	if(ucCurrent_Mode){
-		// Winter mode
-		alarm.time.hour += 1;
+	if(ucActiveInactive_Mode == INACTIVE_MODE){
+		// Inactive mode
+		alarm.time.hour += 2;
 		alarm.time.hour %= 24;
 	}else{
-		// Summer mode
+		// Active mode
 		alarm.time.minute += 20;
 		alarm.time.minute %= 60;
 	}
@@ -206,16 +208,100 @@ void configure_mag_sw_int(void (*callback)(void))
 }
 
 /************************************************************************/
+/* @brief Initializes the accelerometer and temperature data buffers
+/* Only call at the start of execution, otherwise data will be lost
+/* @params none
+/* @returns none
+/************************************************************************/
+void configure_databuffers(void)
+{
+	// Configure the buffers and their pointers
+	ucTemperatureArrayPtr = 0;
+	uiAccelerometerMatrixPtr = 0;
+	ucTemperatureDataSets = 0;
+	uiAccelerometerDataSets = 0;
+	// Set the first element of the data set pointer vector to be 0 (the 0th element is where the first data set starts)
+	cTemperatureDataSetPtr[ucTemperatureDataSets] = ucTemperatureArrayPtr;
+	iAccelerometerDataSetPtr[uiAccelerometerDataSets] = ucAccelerometerMatrix;
+	// Set all the rest of the elements of the data set pointer vectors to be -1 (-1 represents unused)
+	for(int i = 1; i < TEMP_BUFFER_SIZE; i++){
+		cTemperatureDataSetPtr[i] = -1;
+	}
+	for(int i = 1; i < ACCEL_BUFFER_SIZE; i++){
+		iAccelerometerDataSetPtr[i] = -1;
+	}
+}
+
+/************************************************************************/
+/* @brief get_timestamp get the system timestamp in seconds since 2000
+/* @params ucTimestampVector vector that will contain the timestamp
+/* @returns none
+/************************************************************************/
+void get_timestamp(uint8_t * ucTimestampVector)
+{
+	uint32_t ulRegVal;
+	struct rtc_calendar_time stCurrentTime;
+	rtc_calendar_get_time(&rtc_instance, &stCurrentTime);
+	ulRegVal = rtc_calendar_time_to_register_value(&rtc_instance, &stCurrentTime);
+	
+	*(ucTimestampVector + 3) = ulRegVal >> 0  & 0xFF;
+	*(ucTimestampVector + 2) = ulRegVal >> 8  & 0xFF;
+	*(ucTimestampVector + 1) = ulRegVal >> 16 & 0xFF;
+	*(ucTimestampVector + 0) = ulRegVal >> 24 & 0xFF;
+	
+}
+
+/************************************************************************/
 /* @brief offload_data moves buffered temperature and acceleration
 /* data to off-chip memory
 /* @params none
 /* @returns none
 /************************************************************************/
 void offload_data(void)
-{
-	uint8_t header[3] = {ucTemperatureArrayPtr + 1, uiAccelerometerMatrixPtr + 1, (7 << NIBBLE(1)) & 0x0F};
+{	
+	cpu_irq_enter_critical();
+	uint8_t ucHeaderSize = 2 + 4*(ucTemperatureDataSets + uiAccelerometerDataSets);
+	uint8_t header[ucHeaderSize];
+	uint8_t ucHeaderIndex = 0, ucDataIndex = 0;
+	header[ucHeaderIndex++] = ucHeaderSize;
+	header[ucHeaderIndex++] = ucTemperatureDataSets + uiAccelerometerDataSets;
+	// Using these for loops is a bit overkill, but it shows more clearly that the upper nibble and lower nibble are
+	//		separate fields.
+	// Fill in the descriptors the temperature data sets
+	for(ucDataIndex = 0; ucDataIndex < ucTemperatureDataSets - 1; ucDataIndex+=2){
+		header[ucHeaderIndex++] = LNIBBLE(TEMPERATURE_DESCRIPTOR) | UNIBBLE(TEMPERATURE_DESCRIPTOR << 4);
+	}
+	// If there are an uneven number of temperature data sets, then we need to put one temp descriptor with one accel descriptor
+	ucDataIndex = 0;
+	if(ucTemperatureDataSets % 2){
+		header[ucHeaderIndex++] = LNIBBLE(TEMPERATURE_DESCRIPTOR) | UNIBBLE(ACCEL_DESCRIPTOR << 4);
+		ucDataIndex = 1;
+	}
+	// Fill in the accel descriptors
+	for(ucDataIndex; ucDataIndex < uiAccelerometerDataSets - 1; ucDataIndex+=2){
+		header[ucHeaderIndex++] = LNIBBLE(ACCEL_DESCRIPTOR) | UNIBBLE(ACCEL_DESCRIPTOR << 4);
+	}
+	// If there is an uneven number of datasets for accel, then we need to put the lower nibble in as an accel descriptor
+	if(ucTemperatureDataSets % 2){
+		header[ucHeaderIndex++] = LNIBBLE(ACCEL_DESCRIPTOR);
+	}
+	// Fill in the data set lengths
+	for(ucDataIndex = 0; ucDataIndex < ucTemperatureDataSets - 1; ucDataIndex++){
+		header[ucHeaderIndex++] = cTemperatureDataSetPtr[ucHeaderIndex + 1] - cTemperatureDataSetPtr[ucHeaderIndex];
+	}
+	// Fill in the data set lengths
+	for(ucDataIndex = 0; ucDataIndex < uiAccelerometerDataSets - 1; ucDataIndex++){
+		header[ucHeaderIndex++] = iAccelerometerDataSetPtr[ucHeaderIndex + 1] - iAccelerometerDataSetPtr[ucHeaderIndex];
+	}
+	// Fill in the data lengths, we are assuming 8 bits each
+	for(ucDataIndex = 0; ucDataIndex < ucTemperatureDataSets - 1; ucDataIndex++){
+		header[ucHeaderIndex++] = 8;
+	}
+	for(ucDataIndex = 0; ucDataIndex < uiAccelerometerDataSets - 1; ucDataIndex++){
+		header[ucHeaderIndex++] = 8;
+	}
 	// Write the header
-	for(int i = 0; i < 3; i++)
+	for(int i = 0; i < ucHeaderSize; i++)
 	{
 		// If we are at the end of the die, then switch die and reset the address pointer
 		// If we hit the end of the second die, then we restart at the beginning of the first dei
@@ -223,79 +309,77 @@ void offload_data(void)
 			S70FL01_active_die++;
 			S70FL01_active_die %= 2;
 			S70FL01_address = 0;
-		}
+	 	}
 		S70FL01_verified_write(header[i], S70FL01_active_die, S70FL01_address++);
 	}
+	// TODO change to the new format
 	
-	// Write the actual data
-	for(int i = 1; i < ucTemperatureArrayPtr; i++){
-		// If we are at the end of the die, then switch die and reset the address pointer
-		// If we hit the end of the second die, then we restart at the beginning of the first die
+	// Loop over all the data sets in the temperature data
+	for(int i = 0, ucDataIndex = 0; i < ucTemperatureDataSets - 1; i++){
+		// Check that the memory is not full
 		if(S70FL01_address >= S70FL01_MAX_ADDR){
 			S70FL01_active_die++;
 			S70FL01_active_die %= 2;
 			S70FL01_address = 0;
 		}
-		// The temperature values are delta encoded to 8 bits
-		S70FL01_verified_write((uiTemperatureArray[i] - uiTemperatureArray[i-1]) & 0xFF, S70FL01_active_die, S70FL01_address++);
+		// We have reached the end of actual data
+		if(cTemperatureDataSetPtr[i] < 0){
+			break;
+		}
+		// Write the timestamps
+		S70FL01_verified_write(ucTemperatureTimestamps[i+0], S70FL01_active_die, S70FL01_address++);
+		S70FL01_verified_write(ucTemperatureTimestamps[i+1], S70FL01_active_die, S70FL01_address++);
+		S70FL01_verified_write(ucTemperatureTimestamps[i+2], S70FL01_active_die, S70FL01_address++);
+		S70FL01_verified_write(ucTemperatureTimestamps[i+3], S70FL01_active_die, S70FL01_address++);
+		// Iterate over each block of data
+		for(int j = cTemperatureDataSetPtr[i]; j < cTemperatureDataSetPtr[i] - cTemperatureDataSetPtr[i+1]; j++){
+			// Check that the memory is not full
+			if(S70FL01_address >= S70FL01_MAX_ADDR){
+				S70FL01_active_die++;
+				S70FL01_active_die %= 2;
+				S70FL01_address = 0;
+			}
+			// If we are at the first point, write the entire data point
+			if(j == 0 || j == cTemperatureDataSetPtr[i]){
+				S70FL01_verified_write(uiTemperatureArray[j] >> 0x00 & 0xFF, S70FL01_active_die, S70FL01_address++);
+				S70FL01_verified_write(uiTemperatureArray[j] >> 0x08 & 0xFF, S70FL01_active_die, S70FL01_address++);
+			}
+			// Otherwise delta encode and write
+			else{
+				S70FL01_verified_write((uiTemperatureArray[j] - uiTemperatureArray[j-1]) >> 0x08 & 0xFF, S70FL01_active_die, S70FL01_address++);
+			}
+		}
 	}
-	for(uint16_t i = 1; i < uiAccelerometerMatrixPtr; i++){
-		// If we are at the end of the die, then switch die and reset the address pointer
-		// If we hit the end of the second die, then we restart at the beginning of the first die
-		if(S70FL01_address + 3 >= S70FL01_MAX_ADDR){
+	// Loop over all the data sets in the accel data
+	for(int i = 0, ucDataIndex = 0; i < uiAccelerometerDataSets - 1; i++){
+		// Check that the memory is not full
+		if(S70FL01_address >= S70FL01_MAX_ADDR){
 			S70FL01_active_die++;
 			S70FL01_active_die %= 2;
 			S70FL01_address = 0;
 		}
-		// Only keep the lower 8 bits of the accelerometer data (this is around 12g which is more than a fighter jet.)
-		S70FL01_verified_write(ucAccelerometerMatrix[uiAccelerometerMatrixPtr] & 0xFF, S70FL01_active_die, S70FL01_address++);
-		S70FL01_verified_write(ucAccelerometerMatrix[uiAccelerometerMatrixPtr+1] & 0xFF, S70FL01_active_die, S70FL01_address++);
-		S70FL01_verified_write(ucAccelerometerMatrix[uiAccelerometerMatrixPtr+2] & 0xFF, S70FL01_active_die, S70FL01_address++);
+		if(iAccelerometerDataSetPtr[i] < 0){
+			break;
+		}
+		S70FL01_verified_write(ucAccelTimestamps[i+0], S70FL01_active_die, S70FL01_address++);
+		S70FL01_verified_write(ucAccelTimestamps[i+1], S70FL01_active_die, S70FL01_address++);
+		S70FL01_verified_write(ucAccelTimestamps[i+2], S70FL01_active_die, S70FL01_address++);
+		S70FL01_verified_write(ucAccelTimestamps[i+3], S70FL01_active_die, S70FL01_address++);
+		// Iterate over each block of data
+		for(int j = iAccelerometerDataSetPtr[i]; j < iAccelerometerDataSetPtr[i] - iAccelerometerDataSetPtr[i+1]; j++){
+			// Check that the memory is not full
+			if(S70FL01_address >= S70FL01_MAX_ADDR){
+				S70FL01_active_die++;
+				S70FL01_active_die %= 2;
+				S70FL01_address = 0;
+			}
+			// We are already only storing 8 bit numbers for the accel data, so no need for delta encoding
+			S70FL01_verified_write(ucAccelerometerMatrix[j+0], S70FL01_active_die, S70FL01_address++);
+			S70FL01_verified_write(ucAccelerometerMatrix[j+1], S70FL01_active_die, S70FL01_address++);
+			S70FL01_verified_write(ucAccelerometerMatrix[j+2], S70FL01_active_die, S70FL01_address++);			
+		}
 	}
-}
-
-/************************************************************************/
-/* @brief offload_temperature_data moves data from the internal temperature 
-/* data buffer to off chip-memory
-/* @params none
-/* @returns none
-/************************************************************************/
-void offload_temperature_data(void)
-{
-	uint16_t value;
-	// If we are at the end of the die, then switch die and reset the address pointer
-	// If we hit the end of the second die, then we restart at the beginning of the first die
-	if(S70FL01_address >= S70FL01_MAX_ADDR){
-		S70FL01_active_die++;
-		S70FL01_active_die %= 2;
-		S70FL01_address = 0;
-	}
-	// Write the first value in the array everything after this point will be delta encoded
-	S70FL01_verified_write(uiTemperatureArray[0], S70FL01_active_die, S70FL01_address);
-	for(int i = 1; i < ucTemperatureArrayPtr; i++)
-	{	
-		// Get the delta
-		value = uiTemperatureArray[i] - uiTemperatureArray[i-1];
-		// Force the data into 4 bits, hope we don't lose any information
-		// Upper nibble is the temperature descriptor, lower nibble is the value
-		value = (TEMPERATURE_DESCRIPTOR << NIBBLE(1) & 0xF0) & (value & 0xF);
-		// Write the encoded and described element to memory
-		S70FL01_verified_write(value, S70FL01_active_die, S70FL01_address);
-	}
-}
-
-/************************************************************************/
-/* @brief offload_accelerometer_data moves data from the internal accelerometer
-/* data buffer to off chip-memory
-/* @params none
-/* @returns none
-/************************************************************************/
-void offload_accelerometer_data(void)
-{
-	for(int i = 0; i < ucAccelerometerMatrix; i++)
-	{
-		
-		// Write the data in the array
-		S70FL01_verified_write(uiTemperatureArray[0], S70FL01_active_die, S70FL01_address);
-	}
+	// Reconfigure the buffers and their pointers
+	configure_databuffers();
+	cpu_irq_leave_critical();	
 }

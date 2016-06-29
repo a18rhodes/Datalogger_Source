@@ -136,4 +136,36 @@ void ADT7420_read_temp(void)
 	// Put the sensor in shutdown and store the temperature in the array
 	port_pin_set_output_level(ADT7420_EN_PIN, false);
 	uiTemperatureArray[ucTemperatureArrayPtr++] = uiTemperature;
+	
+	// If the core temperature is below the set threshold then we are inactive, and we assume stationary mode
+	//		if the core temperature is above the threshold then we are active, and we assume we are still in stationary mode
+	//		otherwise, we do nothing (this case only occurs for thresholds that are not equal)
+	// NOTE--Raw Temp*128 is the conversion for positive numbers, if the animal falls below freezing, things may get weird.
+	if(128*uiTemperature <= ucInactivityTemperatureThreshold){
+		
+		/* Inactive Mode */
+		ucActiveInactive_Mode = INACTIVE_MODE;
+		ucMotion_State = STATIONARY_MODE;
+		
+		// Disable the accelerometer activity interrupt
+		ADXL375_disable_interrupt(ADXL375_INT_SRC_ACTIVITY);
+		
+		// We have switched modes, so the temperature data now needs to be marked as a new dataset
+		ucTemperatureDataSets++;
+		cTemperatureDataSetPtr[ucTemperatureDataSets] = ucTemperatureArrayPtr;
+		get_timestamp(ucTemperatureTimestamps[ucTemperatureDataSets]);
+	}else if(128*uiTemperature > ucActivityTemperatureThreshold){
+		
+		/* Active Mode */
+		ucActiveInactive_Mode = ACTIVE_MODE;
+		ucMotion_State = STATIONARY_MODE;
+		
+		// Re-enable the activity interrupt -- we need to do this because we are exiting inactive mode where the activity interrupt is disabledf
+		ADXL375_enable_interrupt(ADXL375_INT_SRC_ACTIVITY);
+		
+		// We have switched modes, so the temperature data now needs to be marked as a new dataset
+		ucTemperatureDataSets++;
+		cTemperatureDataSetPtr[ucTemperatureDataSets] = ucTemperatureArrayPtr;
+		get_timestamp(ucTemperatureTimestamps[ucTemperatureDataSets]);
+	}
 }

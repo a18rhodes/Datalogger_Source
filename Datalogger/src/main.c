@@ -47,13 +47,19 @@ int main (void)
   	configure_rtc();
 	port_pin_set_output_level(SP1ML_EN_PIN,true);
 	configure_ADT7420();
+	configure_databuffers();
 	
-	ucCurrent_Mode = SUMMER_MODE;
+	// Assume that we are in active mode during stationary period
+	ucActiveInactive_Mode = ACTIVE_MODE;
+	ucMotion_State = STATIONARY_MODE;
+	
+	// Per Dr. Buck, 30C is the pivot point -- These don't necessarily have to be the same, they can build in some hysteresis depending upon the subject
+	ucActivityTemperatureThreshold = 30;
+	ucInactivityTemperatureThreshold = 30;
 	
 	while(true)
 	{	
-		/* TODO change this to offload both buffers if Flikkema is okay with it */
-		if((uiAccelerometerMatrixPtr > (1024 - 32)) || (ucTemperatureArrayPtr > 71)){
+		if((uiAccelerometerMatrixPtr > (300 - 32)) || (ucTemperatureArrayPtr > 71)){
 			// Accelerometer total buffer size minus the ADXL375 internal FIFO size
 			// If either buffer is full enough that another set of samples cannot be stored, trigger an offload
 			offload_data();
@@ -67,7 +73,7 @@ int main (void)
 			S70FL01_active_die %= 2;
 			S70FL01_address = 0;
 		}
-		
+		ADT7420_read_temp();
 		// Housekeeping done -- go back to sleep
 		sleep();
 	}

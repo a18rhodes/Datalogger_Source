@@ -20,6 +20,7 @@ void ADXL375_disable_interrupt(uint8_t interrupt_src);
 void ADXL375_enable_interrupt(uint8_t interrupt_src);
 
 uint8_t ADXL375_inactive_interrupts;
+uint8_t ADXL375_buffer_full_count;
 
 /* Defines for the ADXL375 temperature sensor */
 

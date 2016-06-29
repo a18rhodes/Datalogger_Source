@@ -6,7 +6,11 @@
 #include "HAL.h"
 #include <asf.h>
 
-/ 
+/**************************************************************************/
+/* @brief configure_ADXL375 function to configure the ADXL375 accelerometer
+/* @params none
+/* @returns none
+**************************************************************************/
 void configure_ADXL375(void)
 {
 	// All buffers are separate for readability
@@ -14,19 +18,23 @@ void configure_ADXL375(void)
 	uint16_t timeout = 0;
 	// FIFO Stream mode (ring buffer) and 32 data points
 	uint8_t wr_buffer1[2] = {ADXL375_FIFO_ADDR, ADXL375_FIFO_STREAM | 0x1F};
+	// Map interrupts for act, watermark, and inact to int1
+	uint8_t wr_buffer4[2] = {ADXL375_INT_MAP_ADDR, (~ADXL375_INT_MAP_ACTIVITY & ~ADXL375_INT_SRC_WATERMARK & ~ADXL375_INT_SRC_INACTIVITY) & 0xFF};
+	// Enable interrupts for activity, inactivity, and watermark
+	uint8_t wr_buffer5[2] = {ADXL375_INT_EN_ADDR, ADXL375_INT_EN_WATERMARK | ADXL375_INT_EN_ACTIVITY};
+	// Set the part to measure and sleep
+	// Realistically, this should be sleep and standby, but the part doesn't wake from standby
+	// FIX: change ADXL375 for ADXL362
+	uint8_t wr_buffer6[2] = {ADXL375_POWER_CTL_ADDR, ADXL375_POWER_CTL_SLEEP | ADXL375_POWER_CTL_MEASUSRE};
+	//Set low power mode
+	uint8_t wr_buffer7[2] = {ADXL375_BW_RATE_ADDR, ADXL375_BW_RATE_LOW_PWR};
 	
-	uint8_t wr_buffer4[2] = {ADXL375_INT_MAP_ADDR, (~ADXL375_INT_MAP_ACTIVITY & ~ADXL375_INT_SRC_WATERMARK & ~ADXL375_INT_SRC_WATERMARK) & 0xFF};
-	// Enable interrupts for activity
-	uint8_t wr_buffer5[2] = {ADXL375_INT_EN_ADDR, ADXL375_INT_EN_ACTIVITY | ADXL375_INT_SRC_INACTIVITY};
-	// Set the part to measure mode -- this consumes lots of power. Should be changed to sleep.
-	// There seems to be an issue triggering an interrupt in sleep mode (it doesn't work).
-	uint8_t wr_buffer6[2] = {ADXL375_POWER_CTL_ADDR, ADXL375_POWER_CTL_MEASUSRE | ADXL375_POWER_CTL_MEASUSRE};
 	
 	// Calibrate the sensor before configuring anything else
 	ADXL375_calibrate();
 	
-	ADXL375_set_activity_thresh(5, true, true, true);
-	ADXL375_set_inactivity_thresh(7, 255, true, true, true);
+	ADXL375_set_activity_thresh(4, true, true, true);
+	ADXL375_set_inactivity_thresh(3, 5, true, true, true);
 	
 	i2c_packet.address = ADXL375_ADDR;
 	i2c_packet.ten_bit_address = false;
@@ -60,6 +68,13 @@ void configure_ADXL375(void)
 		if(timeout++ == i2c_master_instance.buffer_timeout) break;
 	}
 	
+	i2c_packet.data = wr_buffer7;
+	timeout = 0;
+	
+	while((status = i2c_master_write_packet_wait(&i2c_master_instance, &i2c_packet)) != STATUS_OK){
+		if(timeout++ == i2c_master_instance.buffer_timeout) break;
+	}
+	
 		
 	// Set up the interrupt pin
 	struct system_pinmux_config config_pinmux;	system_pinmux_get_config_defaults(&config_pinmux);
@@ -79,28 +94,31 @@ void configure_ADXL375(void)
 	REG_EIC_INTENSET |= 0x01;
 	if(!(REG_EIC_INTENSET & 0x01)) return;
 	
-	// Turn filtering off and set detection for falling edge for EXTINT[0]
+	// Turn filtering off and set detection for falling edge for EXTINT[1]
 	REG_EIC_CONFIG0 &= ~0x8;
 	REG_EIC_CONFIG0 |= 0x4;
 	if(!(REG_EIC_CONFIG0 & 0x4) && (REG_EIC_CONFIG0 & 0x8)) return;
 	
-	// Enable asynchronous interrupts for EXTINT[0]
+	// Enable asynchronous interrupts for EXTINT[1]
 	REG_EIC_ASYNCH |= 0x00000001;
 	if(!(REG_EIC_ASYNCH & 0x01)) return;
+	
+	// register the callback function
+	if(!(extint_register_callback(ADXL375_ISR_Handler, 0, EXTINT_CALLBACK_TYPE_DETECT) == STATUS_OK)) return;
 	
 	// Enable the EIC
 	REG_EIC_CTRLA = 0x02;
 	// Wait for the sync to complete
 	while(REG_EIC_SYNCBUSY & 0x02);
-	if(!(REG_EIC_CTRLA & 0x02)) return;
 	
-	// register the callback function
-	if(!(extint_register_callback(ADXL375_ISR_Handler, 0, EXTINT_CALLBACK_TYPE_DETECT) == STATUS_OK)) return;
 	// Set the buffer index pointer to 0
 	uiAccelerometerMatrixPtr = 0;
 	ADXL375_inactive_interrupts = 0;
+	ADXL375_buffer_full_count = 0;
+	
 	
 }
+
 
 /**************************************************************************/
 /* @brief ADXL375_ISR_Handler ADXL375 ISR handler function
@@ -130,8 +148,14 @@ void ADXL375_ISR_Handler(void)
 	}
 	// If the source of the interrupt was movement, handle it.
 	if(buffer & ADXL375_INT_SRC_ACTIVITY){
-		// If we are in winter mode, then switch to summer mode otherwise stay in winter mode
-		ucCurrent_Mode = ucCurrent_Mode == WINTER_MODE ? SUMMER_MODE : WINTER_MODE;
+		// If we are in inactive mode, then switch to active mode
+		ucMotion_State = MOTION_MODE;
+		// We have switched modes, so the temperature data needs to be marked as a new set
+		ucTemperatureDataSets++;
+		cTemperatureDataSetPtr[ucTemperatureDataSets] = ucTemperatureArrayPtr;
+		get_timestamp(ucTemperatureTimestamps[ucTemperatureDataSets]);
+		// Re-enable the inactivity interrupt in case it was disabled previously (this happens when the animal is stationary and the inactive interrupt is triggered more than once)
+		ADXL375_enable_interrupt(ADXL375_INT_SRC_INACTIVITY);
 		// Movement interrupt triggered, enter 12.5 Hz sampling mode
 		ADXL375_begin_sampling();		
 	}
@@ -140,22 +164,34 @@ void ADXL375_ISR_Handler(void)
 		// FIFO is full, read it out
 		// We know that 32 points are in the FIFO since thats the size we set it to
 		for(int i = 0; i < 32; i++){
-			ADXL375_read_samples(ucAccelerometerMatrix + uiAccelerometerMatrixPtr++, 1);
+			
+			ADXL375_read_samples(ucAccelerometerMatrix + uiAccelerometerMatrixPtr, 1);
+			// Three consecutive data points make up one accelerometer data point so point to the next empty location in mem
+			uiAccelerometerMatrixPtr += 4;
 		}
 		// If we have taken 2 sets of samples, then stop (5.12 seconds worth of data)
-		if(!(uiAccelerometerMatrixPtr % 2)) ADXL375_end_sampling();
+		// This section is optional depending upon if ADXL362 also has inactivity
+		if(ADXL375_buffer_full_count >= 2){
+			 ADXL375_end_sampling();
+			 uiAccelerometerDataSets++;
+			 iAccelerometerDataSetPtr[uiAccelerometerDataSets] = uiAccelerometerMatrixPtr;
+			 get_timestamp(ucAccelTimestamps[uiAccelerometerDataSets]);
+		}
 	}
 	// If the source of the interrupt was from inactivity
 	if(buffer & ADXL375_INT_SRC_INACTIVITY){
-		// If we are in summer mode, and we have had greater than 3 interrupts, then switch to winter mode
+		// If we are in active, and we have had greater than 3 interrupts, then switch to inactvie mode
 		// 3 Interrupts yields 12.75 minutes (255/60 is 4.25 minutes per interrupt--255 is the number of seconds to wait for inactivity)
 		if(++ADXL375_inactive_interrupts >= 3){
-			ucCurrent_Mode = ucCurrent_Mode == SUMMER_MODE ? WINTER_MODE : SUMMER_MODE;
+			ucMotion_State = STATIONARY_MODE;
+			// Also need to stop the accel
+			ADXL375_end_sampling();
+			uiAccelerometerDataSets++;
+			iAccelerometerDataSetPtr[uiAccelerometerDataSets] = uiAccelerometerMatrixPtr;
+			get_timestamp(ucAccelTimestamps[uiAccelerometerDataSets]);
 		}
-		// If we are in winter mode already, then disable the inactivity interrupt
-		if(ucCurrent_Mode == WINTER_MODE){
-			ADXL375_disable_interrupt(ADXL375_INT_EN_INACTIVITY);
-		}
+		// We are now stationary, so disable the inactive interrupt
+		ADXL375_disable_interrupt(ADXL375_INT_EN_INACTIVITY);
 	}
 }
 
